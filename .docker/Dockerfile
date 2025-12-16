@@ -40,4 +40,4 @@ RUN cp /app/.env.prod /app/.env
 EXPOSE 8081
 
 # Run the server
-CMD ["./server"]
+CMD ["./server"] 
