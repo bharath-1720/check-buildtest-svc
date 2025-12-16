@@ -1,0 +1,43 @@
+# --- CHECK DIFF (FIXED FOR FIRST BUILD) ---
+
+* name: "alpine/git"
+  id: check-diff
+  secretEnv: ["SSH_KEY"]
+  entrypoint: "ash"
+  args:
+
+  * -c
+  * |
+    mkdir -p /root/.ssh
+    echo "$$SSH_KEY" > /root/.ssh/id_rsa
+    chmod 400 /root/.ssh/id_rsa
+    ssh-keyscan github.com > /root/.ssh/known_hosts
+
+    git fetch --unshallow origin production || git fetch origin production
+    git checkout production
+
+    # 🔹 FIRST COMMIT / NEW REPO CHECK
+
+    if ! git rev-parse HEAD~1 >/dev/null 2>&1; then
+    echo "First commit detected — forcing image build"
+    echo "_SKIP_BUILD=false" >> /workspace/skip_build.txt
+    exit 0
+    fi
+
+    echo "Checking git diff inside the same repo..."
+    CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+    echo "$$CHANGED_FILES"
+
+    TOTAL_CHANGES=$(echo "$$CHANGED_FILES" | wc -l)
+    SKAFOLD_CONFIG_CHANGES=$(echo "$$CHANGED_FILES" | grep -c -e "^skaffold.yaml$" -e "^.gcp/build/config.yaml$")
+    HOTFIX_BRANCH=$(cat /workspace/branch_flags.txt | cut -d= -f2)
+
+    if [ -z "$$CHANGED_FILES" ] && [ "$$HOTFIX_BRANCH" = "false" ]; then
+    echo "_SKIP_BUILD=true" >> /workspace/skip_build.txt
+    elif [ "$$TOTAL_CHANGES" -eq "$$SKAFOLD_CONFIG_CHANGES" ] && [ "$$HOTFIX_BRANCH" = "false" ]; then
+    echo "_SKIP_BUILD=true" >> /workspace/skip_build.txt
+    else
+    echo "_SKIP_BUILD=false" >> /workspace/skip_build.txt
+    fi
+
+    cat /workspace/skip_build.txt

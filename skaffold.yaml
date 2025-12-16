@@ -1,0 +1,46 @@
+apiVersion: skaffold/v3
+kind: Config
+metadata:
+  name: supportv2-svc
+
+
+# Define a base Helm release as an anchor
+deploy:
+  helm:
+    releases:
+      - &baseRelease
+        name: supportv2-svc
+        remoteChart: oci://asia-south1-docker.pkg.dev/prj-c-cloudbuild-lk57/helm-base/backend-chart
+        version: 0.2.1
+        valuesFiles:
+          - values/dev.yaml
+        namespace: instant
+        setValues:
+          deployments.supportv2svc.containers[0].image.repository: imageurl
+          deployments.supportv2svc.containers[0].image.tag: latest
+
+profiles:
+  - name: dev
+    deploy:
+      helm:
+        releases:
+          - <<: *baseRelease
+            valuesFiles:
+              - values/dev.yaml
+            wait: true
+
+  - name: non-prod
+    deploy:
+      helm:
+        releases:
+          - <<: *baseRelease
+            valuesFiles:
+              - values/non-prod.yaml
+
+  - name: prod
+    deploy:
+      helm:
+        releases:
+          - <<: *baseRelease
+            valuesFiles:
+              - values/prod.yaml

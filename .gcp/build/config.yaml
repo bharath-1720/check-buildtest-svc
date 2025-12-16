@@ -1,0 +1,192 @@
+steps:
+  # Detecting branch type for pipeline selection
+  - name: "alpine/git"
+    id: detect-branch
+    secretEnv: ["SSH_KEY"]
+    entrypoint: "ash"
+    args:
+      - -c
+      - |
+        mkdir -p /root/.ssh
+        echo "$$SSH_KEY" > /root/.ssh/id_rsa
+        chmod 400 /root/.ssh/id_rsa
+        ssh-keyscan github.com > /root/.ssh/known_hosts
+
+        git fetch origin
+        
+        # Determine hotfix type based on branch name
+        if [[ "$BRANCH_NAME" == hotfix/prod* ]]; then
+          echo "HOTFIX_TYPE=prod" >> /workspace/branch_flags.txt
+          echo "Detected hotfix-prod branch - will use direct-to-prod pipeline"
+        elif [[ "$BRANCH_NAME" == hotfix/qa* ]]; then
+          echo "HOTFIX_TYPE=nonprod" >> /workspace/branch_flags.txt
+          echo "Detected hotfix-qa branch - will use 2-step pipeline"
+        else
+          echo "HOTFIX_TYPE=none" >> /workspace/branch_flags.txt
+          echo "Regular branch detected"
+        fi
+        
+        echo "Current branch: $BRANCH_NAME"
+        cat /workspace/branch_flags.txt
+
+  - name: "alpine/git"
+    secretEnv: ["SSH_KEY"]
+    entrypoint: "ash"
+    args:
+      - -c
+      - |
+        mkdir -p /root/.ssh
+        echo "$$SSH_KEY" >> /root/.ssh/id_rsa
+        echo "$$SSH_KEY" >> /workspace/id_rsa
+        chmod 400 /root/.ssh/id_rsa
+        ssh-keyscan github.com > /root/.ssh/known_hosts
+        git config --global --add url."git@github.com:".insteadOf "https://github.com/"
+        git remote set-url origin git@github.com:homingos/$REPO_NAME.git
+        git submodule update --init
+        git lfs install
+        git lfs pull
+
+  - name: "alpine/git"
+    id: check-diff
+    secretEnv: ["SSH_KEY"]
+    entrypoint: "ash"
+    args:
+      - -c
+      - |
+        mkdir -p /root/.ssh
+        echo "$$SSH_KEY" > /root/.ssh/id_rsa
+        chmod 400 /root/.ssh/id_rsa
+        ssh-keyscan github.com > /root/.ssh/known_hosts
+
+        git fetch --unshallow origin production || git fetch origin production || true
+        # Check if production branch exists
+        if ! git rev-parse --verify origin/production >/dev/null 2>&1; then
+          echo "Production branch doesn't exist - this is a new service"
+          echo "_SKIP_BUILD=false" >> /workspace/skip_build.txt
+          echo "Proceeding with build: New service deployment"
+          cat /workspace/skip_build.txt
+          exit 0
+        fi
+
+        git checkout production
+        # Check if HEAD~1 exists (i.e., is there a previous commit?)
+        if ! git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+          echo "No previous commit found - this is the first commit to production"
+          echo "_SKIP_BUILD=false" >> /workspace/skip_build.txt
+          echo "Proceeding with build: First commit to production branch"
+          cat /workspace/skip_build.txt
+          exit 0
+        fi
+        
+        echo "Checking git diff inside the same repo..."
+        CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+        echo $$CHANGED_FILES
+
+        TOTAL_CHANGES=$(echo "$$CHANGED_FILES" | wc -l)
+        SKAFFOLD_ONLY_CHANGES=$(echo "$$CHANGED_FILES" | grep -c "^skaffold.yaml$" || echo "0")
+        HOTFIX_TYPE=$(cat /workspace/branch_flags.txt | cut -d= -f2)
+
+        # Set _SKIP_BUILD flag
+        # Skip build ONLY if:
+        # 1. Empty commit on non-hotfix branch, OR
+        # 2. Only skaffold.yaml changed on non-hotfix branch
+        if [ -z "$$CHANGED_FILES" ] && [ "$$HOTFIX_TYPE" = "none" ]; then
+          # Empty commit on regular branch
+          echo "_SKIP_BUILD=true" >> /workspace/skip_build.txt
+          echo "Skipping build: Empty commit on non-hotfix branch"
+        elif [ "$$TOTAL_CHANGES" -eq "$$SKAFFOLD_ONLY_CHANGES" ] && [ "$$SKAFFOLD_ONLY_CHANGES" -gt "0" ] && [ "$$HOTFIX_TYPE" = "none" ]; then
+          # Only skaffold.yaml changed on regular branch
+          echo "_SKIP_BUILD=true" >> /workspace/skip_build.txt
+          echo "Skipping build: Only skaffold.yaml changed on non-hotfix branch"
+        else
+          # All other cases: build (includes all hotfix branches)
+          echo "_SKIP_BUILD=false" >> /workspace/skip_build.txt
+          echo "Proceeding with build"
+        fi
+
+        echo "Changed files: \"$$CHANGED_FILES\""
+        echo "Hotfix type: $$HOTFIX_TYPE"
+        echo "Total changes: $$TOTAL_CHANGES"
+        echo "Skaffold-only changes: $$SKAFFOLD_ONLY_CHANGES"
+        cat /workspace/skip_build.txt
+  
+  # Build Docker image (skip only if _SKIP_BUILD=true)
+  - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      - -c
+      - |
+        SKIP_BUILD=$(cat /workspace/skip_build.txt | cut -d= -f2)
+        if [ "$$SKIP_BUILD" = "true" ]; then
+          echo "Skipping image build due to skip-build flag"
+        else
+          docker build -f .docker/Dockerfile -t asia-south1-docker.pkg.dev/$PROJECT_ID/homingos/$REPO_NAME:$COMMIT_SHA .
+          docker push asia-south1-docker.pkg.dev/$PROJECT_ID/homingos/$REPO_NAME:$COMMIT_SHA
+        fi
+        
+  - name: "alpine/git"
+    secretEnv: ["SSH_KEY"]
+    entrypoint: "ash"
+    args:
+      - -c
+      - |
+        mkdir -p /root/.ssh
+        echo "$$SSH_KEY" > /root/.ssh/id_rsa
+        chmod 400 /root/.ssh/id_rsa
+        ssh-keyscan github.com > /root/.ssh/known_hosts
+        git clone git@github.com:homingos/service-helm-values.git /workspace/helm
+        cp -r /workspace/helm/$REPO_NAME/values /workspace/values
+        cd /workspace/values
+        ls
+  
+  # Get the latest image tag from artifact registry
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: get-latest-image-tag
+    entrypoint: "bash"
+    args:
+      - -c
+      - |
+        echo "Fetching the latest image tag from Artifact Registry..."
+        _LATEST_IMAGE_TAG=$(gcloud artifacts docker images list asia-south1-docker.pkg.dev/$PROJECT_ID/homingos/$REPO_NAME --sort-by=~CREATE_TIME --limit=1 --format="value(tags[0])" --include-tags)
+        echo $$_LATEST_IMAGE_TAG
+        echo "_LATEST_IMAGE_TAG=$$_LATEST_IMAGE_TAG" >> /workspace/latest_image_tag.txt
+        cat /workspace/latest_image_tag.txt
+  
+  # Create Cloud Deploy release with pipeline selection based on branch type
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: create-release
+    entrypoint: "bash"
+    args:
+      - -c
+      - |
+        echo "Creating Cloud Deploy release..."
+        _LATEST_IMAGE_TAG=$(cat /workspace/latest_image_tag.txt | cut -d= -f2)
+        echo "Latest image tag: $$_LATEST_IMAGE_TAG"
+        
+        # Determine which pipeline to use based on branch type
+        HOTFIX_TYPE=$(cat /workspace/branch_flags.txt | cut -d= -f2)
+        
+        if [ "$$HOTFIX_TYPE" = "prod" ]; then
+          _PIPELINE_NAME="fi-hotfix-direct-prod-pipeline"
+          echo "hotfix-prod branch detected. Using direct-to-prod pipeline: $$_PIPELINE_NAME"
+        elif [ "$$HOTFIX_TYPE" = "nonprod" ]; then
+          _PIPELINE_NAME="fi-hotfix-pipeline"
+          echo "hotfix-qa branch detected. Using 2-step pipeline: $$_PIPELINE_NAME"
+        else
+          _PIPELINE_NAME="$_DEPLOYMENT_PIPELINE_NAME"
+          echo "Regular branch. Using default pipeline: $$_PIPELINE_NAME"
+        fi
+
+        gcloud auth configure-docker asia-south1-docker.pkg.dev --quiet
+        gcloud deploy releases create release-$SHORT_SHA \
+        --region=asia-south1 \
+        --delivery-pipeline=$$_PIPELINE_NAME \
+        --annotations="triggered_by=cloudbuild" \
+        --images=imageurl=asia-south1-docker.pkg.dev/$PROJECT_ID/homingos/$REPO_NAME:$$_LATEST_IMAGE_TAG
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/SSH_KEY/versions/latest
+      env: "SSH_KEY"
